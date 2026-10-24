@@ -309,11 +309,15 @@ def anotar_ejecucion(tienda, categoria, n, segundos, estado):
     """Bitácora de cada corrida: sirve para documentar fallos y bloqueos en el reporte."""
     DIR_SALIDA.mkdir(parents=True, exist_ok=True)
     nuevo = not REGISTRO_EJECUCIONES.exists()
-    with open(REGISTRO_EJECUCIONES, "a", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        if nuevo:
-            w.writerow(["fecha", "tienda", "categoria", "registros", "segundos", "estado"])
-        w.writerow([ahora_iso(), tienda, categoria, n, round(segundos), estado])
+    try:
+        with open(REGISTRO_EJECUCIONES, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            if nuevo:
+                w.writerow(["fecha", "tienda", "categoria", "registros", "segundos", "estado"])
+            w.writerow([ahora_iso(), tienda, categoria, n, round(segundos), estado])
+    except PermissionError:
+        # Pasa si el archivo está abierto en Excel; los datos ya se guardaron.
+        print(f"  aviso: no se pudo escribir {REGISTRO_EJECUCIONES.name} (¿abierto en Excel?)")
 
 
 def resumen(registros, segundos):
