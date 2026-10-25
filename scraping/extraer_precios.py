@@ -1,16 +1,25 @@
 """Extracción diaria de precios, descuentos y stock antes del Buen Fin 2026.
 
-Recorre las categorías de laptops y tablets de Cyberpuerta y Elektra y guarda
-una observación por producto x tienda x ejecución. Cada registro conserva la
-URL de origen y la fecha de extracción. Pensado para ejecutarse una vez al día.
+Fuentes:
+- Cyberpuerta: listados de categoría con Selenium (carga diferida de tarjetas y
+  precio dibujado con un componente animado). Se recorren páginas hasta reunir
+  --max fichas válidas y, si existe un panel, hasta encontrar sus publicaciones.
+- Elektra: catálogo público de la tienda (API VTEX permitida en su robots.txt),
+  por categoría exacta y en orden fijo. Su listado web cambia de orden en cada
+  carga, por lo que no sirve para seguir las mismas publicaciones.
+
+Cada fila es una observación oferta x corrida, con URL de origen, fecha de
+extracción, claves (ver comun.py) y si entra al estudio o por qué se excluye.
+Los CSV originales nunca se modifican: cada corrida crea archivos nuevos.
 
 Uso:
-    python scraping/extraer_precios.py                       # todo, 300 por categoría
-    python scraping/extraer_precios.py --tiendas elektra --categorias tablets --max 50 --visible
+    python scraping/extraer_precios.py
+    python scraping/extraer_precios.py --tiendas cyberpuerta --categorias tablets --max 30 --visible
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import re
@@ -18,36 +27,47 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+import comun
+
 RAIZ = Path(__file__).resolve().parent.parent
 DIR_SALIDA = RAIZ / "data" / "raw"
-REGISTRO_EJECUCIONES = DIR_SALIDA / "registro_ejecuciones.csv"
+REGISTRO_CORRIDAS = DIR_SALIDA / "registro_corridas.csv"
+PANEL = RAIZ / "data" / "procesado" / "panel.csv"
 
-CATEGORIAS = {
-    "cyberpuerta": {
-        "laptops": "https://www.cyberpuerta.mx/Computadoras/Laptops/",
-        "tablets": "https://www.cyberpuerta.mx/Computadoras/Tablets/Tablets/",
-    },
-    # En Elektra estas rutas son resultados de búsqueda: incluyen accesorios,
-    # que se filtran en la limpieza con la columna categoria_tienda.
-    "elektra": {
-        "laptops": "https://www.elektra.mx/laptops",
-        "tablets": "https://www.elektra.mx/tablets",
-    },
+URL_CYBERPUERTA = {
+    "laptops": "https://www.cyberpuerta.mx/Computadoras/Laptops/",
+    "tablets": "https://www.cyberpuerta.mx/Computadoras/Tablets/Tablets/",
 }
+# Rutas de categoría del catálogo de Elektra (Cómputo > Portátiles > ..., Cómputo > Tablets y Accesorios > Tablets)
+CATEGORIAS_ELEKTRA = {
+    "laptops": ["1371654/1371720/1372099", "1371654/1371720/4656482", "1371654/1371720/1372102"],
+    "tablets": ["1371654/1371728/1372132"],
+}
+API_ELEKTRA = "https://www.elektra.mx/api/catalog_system/pub/products/search"
+LOTE_API = 50  # máximo que acepta la API por petición
 
-PAUSA_MIN, PAUSA_MAX = 3.0, 6.0  # segundos entre páginas, para no saturar al sitio
+PAUSA_MIN, PAUSA_MAX = 3.0, 6.0  # segundos entre páginas web
+PAUSA_API = 1.5                  # segundos entre peticiones a la API
+AGENTE_API = "Mozilla/5.0 (compatible; proyecto-academico-precios/1.0)"
 
 CAMPOS = [
-    "tienda", "categoria", "fecha_extraccion", "url_origen", "url_producto", "posicion",
-    "id_producto", "modelo", "nombre", "marca", "vendedor", "categoria_tienda",
+    "corrida_id", "fecha_corrida", "tienda", "categoria", "fuente", "cobertura",
+    "fecha_extraccion", "url_origen", "url_producto", "posicion",
+    "id_producto", "sku_id", "sku_orden", "gtin", "modelo", "nombre", "marca",
+    "vendedor", "vendedor_id", "vendedor_predeterminado", "categoria_tienda",
+    "condicion", "es_paquete",
     "precio_actual", "precio_lista", "descuento_anunciado_pct",
-    "costo_envio", "stock_piezas", "stock_texto", "disponibilidad", "especificaciones",
+    "costo_envio", "stock_piezas", "stock_texto", "disponible", "disponibilidad",
+    "especificaciones",
+    "clave_publicacion", "clave_oferta", "clave_producto_candidata",
+    "incluido", "motivo_exclusion",
 ]
 
 # Textos que indican un reto antibots o CAPTCHA. Si aparecen, la tienda se omite:
@@ -64,8 +84,8 @@ def ahora_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def pausa():
-    time.sleep(random.uniform(PAUSA_MIN, PAUSA_MAX))
+def pausa(minimo=PAUSA_MIN, maximo=PAUSA_MAX):
+    time.sleep(random.uniform(minimo, maximo))
 
 
 def a_numero(texto):
@@ -84,6 +104,34 @@ def piezas(texto):
     return int(m.group(1).replace(",", "")) if m else None
 
 
+def completar(fila, corrida, vistos):
+    """Agrega claves, condición y la decisión de inclusión. `vistos` evita duplicados en la corrida."""
+    fila.update(corrida)
+    fila["clave_publicacion"] = comun.clave_publicacion(fila["tienda"], fila["url_producto"], fila["id_producto"])
+    fila["clave_oferta"] = comun.clave_oferta(fila["clave_publicacion"], fila["vendedor"], fila["sku_id"])
+    fila["clave_producto_candidata"] = comun.clave_producto_candidata(fila["marca"], fila["modelo"])
+    fila["condicion"] = comun.condicion(fila["nombre"], fila["categoria_tienda"])
+    fila["es_paquete"] = comun.es_paquete(fila["nombre"])
+    motivo = comun.motivo_exclusion(fila["categoria"], fila["nombre"], fila["categoria_tienda"], fila["tienda"],
+                                    fila["precio_actual"], fila["disponible"], fila["vendedor"])
+    if motivo is None and fila["clave_oferta"] in vistos:
+        motivo = "duplicado_en_corrida"
+    vistos.add(fila["clave_oferta"])
+    fila["incluido"] = motivo is None
+    fila["motivo_exclusion"] = motivo
+    return fila
+
+
+def leer_panel(tienda, categoria):
+    if not PANEL.exists():
+        return set()
+    with open(PANEL, encoding="utf-8-sig") as f:
+        return {r["clave_publicacion"] for r in csv.DictReader(f)
+                if r["tienda"] == tienda and r["categoria"] == categoria}
+
+
+# ---------------------------------------------------------------- Cyberpuerta
+
 def crear_driver(visible=False):
     opciones = webdriver.ChromeOptions()
     if not visible:
@@ -100,8 +148,6 @@ def revisar_bloqueo(driver):
     if any(s in texto for s in SENALES_BLOQUEO):
         raise BloqueoDetectado(f"{driver.current_url} -> '{driver.title}'")
 
-
-# ---------------------------------------------------------------- Cyberpuerta
 
 JS_CYBERPUERTA = r"""
 const ld = [...document.querySelectorAll('script[type="application/ld+json"]')]
@@ -166,9 +212,15 @@ def cargar_tarjetas_cyberpuerta(driver, espera=20):
     return pendientes
 
 
-def extraer_cyberpuerta(driver, url_base, categoria, maximo):
-    registros, pagina = [], 1
-    while len(registros) < maximo:
+def extraer_cyberpuerta(driver, categoria, maximo, corrida, max_paginas):
+    url_base = URL_CYBERPUERTA[categoria]
+    panel = leer_panel("cyberpuerta", categoria)
+    registros, vistos, pagina = [], set(), 1
+    while pagina <= max_paginas:
+        validos = sum(r["incluido"] for r in registros)
+        faltan_panel = panel - {r["clave_publicacion"] for r in registros}
+        if validos >= maximo and not faltan_panel:
+            break
         url = url_base if pagina == 1 else f"{url_base}?pgNr={pagina}"
         driver.get(url)
         revisar_bloqueo(driver)
@@ -183,20 +235,16 @@ def extraer_cyberpuerta(driver, url_base, categoria, maximo):
             print(f"  aviso: {sin_cargar} tarjetas no cargaron en {url}")
         fecha = ahora_iso()
         tarjetas = driver.execute_script(JS_CYBERPUERTA)
-        for i, t in enumerate(tarjetas, start=1):
+        for t in tarjetas:
             envio = t["envio"] or ""
-            registros.append({
-                "tienda": "cyberpuerta",
-                "categoria": categoria,
-                "fecha_extraccion": fecha,
-                "url_origen": url,
-                "url_producto": t["url_producto"],
+            registros.append(completar({
+                "tienda": "cyberpuerta", "categoria": categoria,
+                "fuente": "listado_selenium", "cobertura": "listado_ordenado",
+                "fecha_extraccion": fecha, "url_origen": url, "url_producto": t["url_producto"],
                 "posicion": len(registros) + 1,
-                "id_producto": t["gtin"],
-                "modelo": t["modelo"],
-                "nombre": t["nombre"],
-                "marca": t["marca"],
-                "vendedor": "Cyberpuerta",
+                "id_producto": None, "sku_id": None, "sku_orden": None, "gtin": t["gtin"],
+                "modelo": t["modelo"], "nombre": t["nombre"], "marca": t["marca"],
+                "vendedor": "Cyberpuerta", "vendedor_id": "cyberpuerta", "vendedor_predeterminado": True,
                 "categoria_tienda": t["categoria"],
                 "precio_actual": a_numero(t["precio_dom"]) or a_numero(t["precio_ld"]),
                 "precio_lista": a_numero(t["precio_lista"]),
@@ -204,96 +252,98 @@ def extraer_cyberpuerta(driver, url_base, categoria, maximo):
                 "costo_envio": 0.0 if "gratis" in envio.lower() else a_numero(envio),
                 "stock_piezas": piezas(t["stock_texto"]),
                 "stock_texto": t["stock_texto"],
+                "disponible": None,
                 "disponibilidad": (t["disponibilidad"] or "").rsplit("/", 1)[-1] or None,
                 "especificaciones": json.dumps(t["specs"], ensure_ascii=False) if t["specs"] else None,
-            })
-        print(f"  página {pagina}: {len(registros)} productos")
+            }, corrida, vistos))
+        validos = sum(r["incluido"] for r in registros)
+        print(f"  página {pagina}: {len(registros)} filas, {validos} válidas")
         if len(tarjetas) < 24:  # última página
             break
         pagina += 1
         pausa()
-    return registros[:maximo]
+    faltan_panel = panel - {r["clave_publicacion"] for r in registros}
+    if panel:
+        print(f"  panel: {len(panel) - len(faltan_panel)}/{len(panel)} publicaciones encontradas en el listado")
+    return registros
 
 
 # -------------------------------------------------------------------- Elektra
 
-JS_ELEKTRA = r"""
-return [...document.querySelectorAll('cite[data-all]')].map(c => {
-  const a = c.closest('a[href]');
-  const hojas = a ? [...a.querySelectorAll('*')].filter(e => e.childElementCount === 0) : [];
-  return {
-    datos: c.dataset.all,
-    url_producto: a?.href || null,
-    descuento: hojas.map(e => e.textContent.trim()).find(t => /^-\d+%$/.test(t)) || null,
-    agotado: a ? /agotado/i.test(a.innerText) : null,
-  };
-});
-"""
+def pedir_api(sesion, params):
+    r = sesion.get(API_ELEKTRA, params=params, timeout=30)
+    if r.status_code in (403, 429):
+        raise BloqueoDetectado(f"API respondió {r.status_code}")
+    r.raise_for_status()
+    total = int(r.headers.get("resources", "0-0/0").rsplit("/", 1)[-1])
+    return r.json(), total, r.url
 
 
-def boton_mostrar_mas(driver):
-    for b in driver.find_elements(By.CSS_SELECTOR, "button"):
-        if "MOSTRAR M" in b.text.upper():
-            return b
-    return None
+def filas_elektra(producto, categoria, posicion, url_origen, fecha):
+    """Una fila por oferta (SKU x vendedor) de una ficha del catálogo."""
+    especificaciones = {k: (v[0] if isinstance(v, list) and len(v) == 1 else v)
+                        for k, v in producto.items() if k in (producto.get("allSpecifications") or [])}
+    categoria_tienda = (producto.get("categories") or ["//"])[0].strip("/").rsplit("/", 1)[-1]
+    modelo = (producto.get("Modelo") or [None])[0]
+    # sku_orden 0 es la variante que muestra el listado web; sirve para empatar con extracciones anteriores
+    for sku_orden, item in enumerate(producto.get("items", [])):
+        for s in item.get("sellers", []):
+            o = s.get("commertialOffer", {})
+            precio, lista = o.get("Price"), o.get("ListPrice")
+            cantidad = o.get("AvailableQuantity")
+            yield {
+                "tienda": "elektra", "categoria": categoria,
+                "fuente": "api_catalogo", "cobertura": "censo_categoria",
+                "fecha_extraccion": fecha, "url_origen": url_origen, "url_producto": producto.get("link"),
+                "posicion": posicion,
+                "id_producto": producto.get("productId"), "sku_id": item.get("itemId"), "sku_orden": sku_orden,
+                "gtin": item.get("ean"),
+                "modelo": modelo, "nombre": producto.get("productName"), "marca": producto.get("brand"),
+                "vendedor": s.get("sellerName"), "vendedor_id": s.get("sellerId"),
+                "vendedor_predeterminado": s.get("sellerDefault"),
+                "categoria_tienda": categoria_tienda,
+                "precio_actual": precio, "precio_lista": lista,
+                # Mismo cálculo que la etiqueta "-x%" del listado (verificado en el piloto: coinciden siempre)
+                "descuento_anunciado_pct": round(100 * (1 - precio / lista)) if precio and lista and lista > precio else None,
+                "costo_envio": None,
+                # AvailableQuantity viene topado (0, 1, 10, 100, 99999): sirve como disponibilidad, no como piezas
+                "stock_piezas": None,
+                "stock_texto": f"AvailableQuantity={cantidad}",
+                "disponible": bool(o.get("IsAvailable")) and (cantidad or 0) > 0,
+                "disponibilidad": "InStock" if o.get("IsAvailable") else "OutOfStock",
+                "especificaciones": json.dumps(especificaciones, ensure_ascii=False) if especificaciones else None,
+            }
 
 
-def extraer_elektra(driver, url, categoria, maximo):
-    driver.get(url)
-    revisar_bloqueo(driver)
-    WebDriverWait(driver, 30).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "cite[data-all]")))
-    # "MOSTRAR MÁS" agrega productos a la misma página: hay que pulsarlo con Selenium.
-    while True:
-        n = len(driver.find_elements(By.CSS_SELECTOR, "cite[data-all]"))
-        print(f"  {n} productos cargados")
-        boton = boton_mostrar_mas(driver)
-        if n >= maximo or boton is None:
-            break
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", boton)
-        try:
-            WebDriverWait(driver, 20).until(
-                lambda d: len(d.find_elements(By.CSS_SELECTOR, "cite[data-all]")) > n)
-        except TimeoutException:
-            print("  'MOSTRAR MÁS' no agregó productos; se detiene")
-            break
-        revisar_bloqueo(driver)
-        pausa()
-
-    fecha = ahora_iso()
-    registros = []
-    for i, t in enumerate(driver.execute_script(JS_ELEKTRA)[:maximo], start=1):
-        d = json.loads(t["datos"])
-        registros.append({
-            "tienda": "elektra",
-            "categoria": categoria,
-            "fecha_extraccion": fecha,
-            "url_origen": url,
-            "url_producto": t["url_producto"],
-            "posicion": i,
-            "id_producto": d.get("product_id"),
-            "modelo": d.get("modelo"),
-            "nombre": d.get("item_name"),
-            "marca": d.get("item_brand"),
-            # sellerId "1" es Elektra; los demás son vendedores del marketplace
-            "vendedor": "Elektra" if d.get("sellerId") == "1" else (d.get("vendor") or d.get("sellerId")),
-            "categoria_tienda": d.get("item_category3"),
-            "precio_actual": a_numero(d.get("price")),
-            "precio_lista": a_numero(d.get("price_without_discount")),
-            "descuento_anunciado_pct": a_numero(t["descuento"]),
-            "costo_envio": None,   # no se muestra en el listado
-            "stock_piezas": None,  # Elektra no publica piezas
-            "stock_texto": "agotado" if t["agotado"] else None,
-            "disponibilidad": None,
-            "especificaciones": None,
-        })
+def extraer_elektra(categoria, corrida):
+    sesion = requests.Session()
+    sesion.headers["User-Agent"] = AGENTE_API
+    registros, vistos, posicion = [], set(), 0
+    for ruta in CATEGORIAS_ELEKTRA[categoria]:
+        desde, total, fichas = 0, 0, 0
+        while True:
+            params = {"fq": f"C:/{ruta}/", "_from": desde, "_to": desde + LOTE_API - 1, "O": "OrderByNameASC"}
+            productos, total_lote, url = pedir_api(sesion, params)
+            # El total del encabezado a veces llega en 0 en el último lote: se conserva el mayor visto
+            total = max(total, total_lote)
+            fecha = ahora_iso()
+            for p in productos:
+                posicion += 1
+                fichas += 1
+                for fila in filas_elektra(p, categoria, posicion, url, fecha):
+                    registros.append(completar(fila, corrida, vistos))
+            desde += LOTE_API
+            if not productos or desde >= total:
+                break
+            time.sleep(PAUSA_API)
+        aviso = "" if fichas == total else f" (el catálogo anunció {total})"
+        print(f"  categoría {ruta}: {fichas} fichas{aviso}")
+    validos = sum(r["incluido"] for r in registros)
+    print(f"  {posicion} fichas, {len(registros)} ofertas, {validos} ofertas válidas")
     return registros
 
 
 # ----------------------------------------------------------------- Ejecución
-
-EXTRACTORES = {"cyberpuerta": extraer_cyberpuerta, "elektra": extraer_elektra}
-
 
 def guardar(registros, tienda, categoria, inicio):
     DIR_SALIDA.mkdir(parents=True, exist_ok=True)
@@ -305,62 +355,82 @@ def guardar(registros, tienda, categoria, inicio):
     return ruta
 
 
-def anotar_ejecucion(tienda, categoria, n, segundos, estado):
-    """Bitácora de cada corrida: sirve para documentar fallos y bloqueos en el reporte."""
+def sha256(ruta):
+    return hashlib.sha256(Path(ruta).read_bytes()).hexdigest()
+
+
+def anotar_corrida(corrida, tienda, categoria, registros, segundos, estado, ruta=None):
+    """Bitácora con el archivo y su huella: permite comprobar que cada CSV tiene su corrida."""
     DIR_SALIDA.mkdir(parents=True, exist_ok=True)
-    nuevo = not REGISTRO_EJECUCIONES.exists()
+    nuevo = not REGISTRO_CORRIDAS.exists()
     try:
-        with open(REGISTRO_EJECUCIONES, "a", newline="", encoding="utf-8-sig") as f:
+        with open(REGISTRO_CORRIDAS, "a", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             if nuevo:
-                w.writerow(["fecha", "tienda", "categoria", "registros", "segundos", "estado"])
-            w.writerow([ahora_iso(), tienda, categoria, n, round(segundos), estado])
+                w.writerow(["corrida_id", "fecha_fin", "tienda", "categoria", "archivo", "filas",
+                            "filas_incluidas", "segundos", "estado", "sha256"])
+            w.writerow([corrida["corrida_id"], ahora_iso(), tienda, categoria,
+                        ruta.name if ruta else "", len(registros), sum(r["incluido"] for r in registros),
+                        round(segundos), estado, sha256(ruta) if ruta else ""])
     except PermissionError:
         # Pasa si el archivo está abierto en Excel; los datos ya se guardaron.
-        print(f"  aviso: no se pudo escribir {REGISTRO_EJECUCIONES.name} (¿abierto en Excel?)")
+        print(f"  aviso: no se pudo escribir {REGISTRO_CORRIDAS.name} (¿abierto en Excel?)")
 
 
 def resumen(registros, segundos):
     n = len(registros)
-    unicos = len({r["url_producto"] for r in registros})
-    print(f"  = {n} registros, {unicos} URLs únicas, {segundos:.0f} s")
-    vacios = [c for c in CAMPOS if not any(r[c] not in (None, "") for r in registros)]
-    if vacios:
-        print(f"  campos siempre vacíos: {', '.join(vacios)}")
+    validos = sum(r["incluido"] for r in registros)
+    motivos = {}
+    for r in registros:
+        if r["motivo_exclusion"]:
+            motivos[r["motivo_exclusion"]] = motivos.get(r["motivo_exclusion"], 0) + 1
+    print(f"  = {n} filas, {validos} válidas, {segundos:.0f} s; excluidas: {motivos or 'ninguna'}")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--tiendas", nargs="+", choices=list(CATEGORIAS), default=list(CATEGORIAS))
+    p.add_argument("--tiendas", nargs="+", choices=["cyberpuerta", "elektra"], default=["cyberpuerta", "elektra"])
     p.add_argument("--categorias", nargs="+", choices=["laptops", "tablets"], default=["laptops", "tablets"])
-    p.add_argument("--max", type=int, default=300, help="productos por tienda y categoría (default 300)")
+    p.add_argument("--max", type=int, default=300, help="fichas válidas por categoría en Cyberpuerta (default 300)")
+    p.add_argument("--max-paginas", type=int, default=30, help="tope de páginas de Cyberpuerta por categoría")
     p.add_argument("--visible", action="store_true", help="mostrar el navegador")
+    p.add_argument("--salida", type=Path, help="carpeta de salida (default data/raw); útil para pruebas")
     args = p.parse_args()
 
+    global DIR_SALIDA, REGISTRO_CORRIDAS
+    if args.salida:
+        DIR_SALIDA = args.salida.resolve()
+        REGISTRO_CORRIDAS = DIR_SALIDA / "registro_corridas.csv"
+
     inicio_corrida = datetime.now()
-    driver = crear_driver(args.visible)
+    corrida = {"corrida_id": inicio_corrida.strftime("%Y%m%dT%H%M%S"), "fecha_corrida": f"{inicio_corrida:%Y-%m-%d}"}
+    driver = crear_driver(args.visible) if "cyberpuerta" in args.tiendas else None
     try:
         for tienda in args.tiendas:
             for categoria in args.categorias:
                 print(f"\n>> {tienda} / {categoria}")
                 inicio = time.time()
                 try:
-                    registros = EXTRACTORES[tienda](driver, CATEGORIAS[tienda][categoria], categoria, args.max)
+                    if tienda == "cyberpuerta":
+                        registros = extraer_cyberpuerta(driver, categoria, args.max, corrida, args.max_paginas)
+                    else:
+                        registros = extraer_elektra(categoria, corrida)
                 except BloqueoDetectado as e:
-                    print(f"  BLOQUEO: {e}. Se omite.")
-                    anotar_ejecucion(tienda, categoria, 0, time.time() - inicio, f"bloqueo: {e}")
-                    continue
-                except (TimeoutException, WebDriverException) as e:
+                    # Ante un bloqueo se detiene toda la tienda: no se reintenta ni se evade.
+                    print(f"  BLOQUEO: {e}. Se detiene {tienda}.")
+                    anotar_corrida(corrida, tienda, categoria, [], time.time() - inicio, f"bloqueo: {e}")
+                    break
+                except (TimeoutException, WebDriverException, requests.RequestException) as e:
                     print(f"  ERROR: {e.__class__.__name__}. Se omite.")
-                    anotar_ejecucion(tienda, categoria, 0, time.time() - inicio, f"error: {e.__class__.__name__}")
+                    anotar_corrida(corrida, tienda, categoria, [], time.time() - inicio, f"error: {e.__class__.__name__}")
                     continue
                 ruta = guardar(registros, tienda, categoria, inicio_corrida)
                 resumen(registros, time.time() - inicio)
-                anotar_ejecucion(tienda, categoria, len(registros), time.time() - inicio, "ok")
-                print(f"  guardado en {ruta.relative_to(RAIZ)}")
-                pausa()
+                anotar_corrida(corrida, tienda, categoria, registros, time.time() - inicio, "ok", ruta)
+                print(f"  guardado en {ruta}")
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
 
 
 if __name__ == "__main__":
